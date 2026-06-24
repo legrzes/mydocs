@@ -1,0 +1,96 @@
+1. Instalacja ProxySQL
+bash# Na hoście, gdzie ma działać ProxySQL (może być osobny VM albo jeden z node'ów)
+
+wget https://repo.proxysql.com/ProxySQL/proxysql-2.7.x/repo_pub_key
+apt-key add repo_pub_key   # lub rpm --import na RHEL
+apt install proxysql       # lub: dnf install proxysql
+systemctl enable --now proxysql
+
+
+2. Utwórz użytkownika monitorującego na klastrze PXC
+Na jednym z node'ów (np. odb07, który zbootstrapowałeś):
+
+
+CREATE USER 'proxysql_monitor'@'192.168.2.%' IDENTIFIED BY 'MonitorPass123!';
+GRANT USAGE, REPLICATION CLIENT ON *.* TO 'proxysql_monitor'@'192.168.2.%';
+
+CREATE USER 'app_user'@'192.168.2.%' IDENTIFIED BY 'AppPass123!';
+GRANT ALL PRIVILEGES ON *.* TO 'app_user'@'192.168.2.%';
+FLUSH PRIVILEGES;
+(zastąp hasła swoimi, i ogranicz GRANT ALL do realnych potrzeb aplikacji)
+
+
+3. Konfiguracja ProxySQL - dodanie node'ów do hostgroup
+Połącz się na port admina ProxySQL:
+
+mysql -u admin -padmin -h 127.0.0.1 -P 6032
+sql
+-- Hostgroup 10 = writer (Primary), Hostgroup 20 = readers
+
+INSERT INTO mysql_servers (hostgroup_id, hostname, port) VALUES
+  (10, '192.168.2.66', 3306),
+  (10, '192.168.2.67', 3306),
+  (10, '192.168.2.68', 3306);
+
+-- ProxySQL native Galera support sam przerzuci węzły między HG 10/20 wg statusu
+
+
+4. Skonfiguruj monitor użytkownika
+
+SET mysql-monitor_username='proxysql_monitor';
+SET mysql-monitor_password='MonitorPass123!';
+SET mysql-monitor_galera_healthcheck_interval=2000;
+SET mysql-monitor_galera_healthcheck_timeout=800;
+LOAD MYSQL VARIABLES TO RUNTIME;
+SAVE MYSQL VARIABLES TO DISK;
+
+
+5. Native Galera support (kluczowe dla PXC!)
+ProxySQL od wersji 2.x ma natywne wsparcie Galera - automatycznie kieruje zapisy na jeden writer node, a odczyty może rozkładać na readery:
+
+INSERT INTO mysql_galera_hostgroups (
+  writer_hostgroup, backup_writer_hostgroup, reader_hostgroup,
+  offline_hostgroup, active, max_writers, writer_is_also_reader,
+  max_transactions_behind
+) VALUES (10, 12, 20, 9, 1, 1, 1, 100);
+
+LOAD MYSQL SERVERS TO RUNTIME;
+SAVE MYSQL SERVERS TO DISK;
+To mówi ProxySQL: "monitoruj wsrep_local_state i wsrep_cluster_status na każdym node'ie, wybierz max 1 writer (HG 10), pozostałe traktuj jako readery (HG 20), a jeśli node odpadnie z klastra - przenieś go do HG 9 (offline)".
+
+6. Dodaj użytkownika aplikacji do ProxySQL
+sqlINSERT INTO mysql_users (username, password, default_hostgroup, active) 
+  VALUES ('app_user', 'AppPass123!', 10, 1);
+
+LOAD MYSQL USERS TO RUNTIME;
+SAVE MYSQL USERS TO DISK;
+
+
+
+7. (Opcjonalnie) Query rules: rozdzielanie SELECT na readery
+sqlINSERT INTO mysql_query_rules (rule_id, active, match_pattern, destination_hostgroup, apply)
+  VALUES (1, 1, '^SELECT.*FOR UPDATE$', 10, 1),
+         (2, 1, '^SELECT', 20, 1);
+
+LOAD MYSQL QUERY RULES TO RUNTIME;
+SAVE MYSQL QUERY RULES TO DISK;
+
+(reguła 1 musi być przed regułą 2 - SELECT ... FOR UPDATE musi iść na writer, zwykłe SELECT na readery)
+
+
+
+8. Weryfikacja
+SELECT hostgroup_id, hostname, status, port FROM mysql_servers;
+SELECT * FROM stats_mysql_connection_pool WHERE hostgroup IN (10,20);
+SELECT * FROM mysql_server_galera_log ORDER BY time_start_us DESC LIMIT 10;
+
+Status node'ów powinien pokazać jeden jako ONLINE w HG 10 (writer), resztę jako ONLINE w HG 20 (readery).
+
+
+
+9. Test z aplikacji
+bashmysql -u app_user -pAppPass123! -h 192.168.2.XX -P 6033 -e "SELECT @@hostname;"
+(port 6033 to port ruchu danych, 6032 to port admina ProxySQL - łatwo to pomylić)
+
+
+
